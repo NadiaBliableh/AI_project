@@ -4,10 +4,13 @@ Smart Plant Watering Scheduler
 Pure Python only — no numpy, pandas, matplotlib, or any third-party library.
 Only standard-library modules are used:
     tkinter  (built-in GUI)
-    csv      (read Excel-exported CSV or the xlsx via manual parsing)
+    csv      (read/write CSV)
     math     (sqrt, exp)
     random   (shuffle, sample, random)
-    openpyxl is NOT used — we read the xlsx with the built-in zipfile + xml.etree
+    re       (regex for name auto-increment)
+    os       (path handling)
+    zipfile  (read xlsx)
+    xml.etree (parse xlsx XML)
 """
 
 import tkinter as tk
@@ -18,6 +21,7 @@ import random
 import zipfile
 import xml.etree.ElementTree as ET
 import os
+import re
 
 # ─────────────────────────────────────────────
 #  PURE-PYTHON HELPERS  (no numpy)
@@ -64,16 +68,34 @@ def euclidean(p1, p2):
 
 # ─────────────────────────────────────────────
 #  XLSX READER  (pure stdlib: zipfile + xml)
+#  FIX: uses col_to_index to handle empty cells
+#       and guarantee correct column ordering
 # ─────────────────────────────────────────────
+
+def col_to_index(col_str):
+    """
+    Convert Excel column letter(s) to 0-based index.
+    A->0, B->1, Z->25, AA->26, AB->27, ...
+    """
+    idx = 0
+    for ch in col_str.upper():
+        idx = idx * 26 + (ord(ch) - ord('A') + 1)
+    return idx - 1
+
 
 def read_xlsx(path):
     """
     Returns list of dicts.  Reads the first sheet only.
     Values are returned as strings; caller converts.
+
+    FIX vs original:
+      - Each cell is stored by its numeric column index (via col_to_index),
+        so empty / missing cells are represented as "" and column ordering
+        is always correct, even when Excel skips sparse cells.
     """
     rows = []
     with zipfile.ZipFile(path) as zf:
-        # shared strings
+        # ── shared strings ──────────────────────────────
         shared = []
         if "xl/sharedStrings.xml" in zf.namelist():
             tree = ET.parse(zf.open("xl/sharedStrings.xml"))
@@ -82,34 +104,44 @@ def read_xlsx(path):
                 t_nodes = si.findall(".//s:t", ns)
                 shared.append("".join((t.text or "") for t in t_nodes))
 
-        # first sheet
+        # ── first sheet ─────────────────────────────────
         sheet_name = "xl/worksheets/sheet1.xml"
-        tree  = ET.parse(zf.open(sheet_name))
-        ns    = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        tree       = ET.parse(zf.open(sheet_name))
+        ns         = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
         sheet_rows = tree.getroot().findall(".//s:row", ns)
 
         header = None
         for row_el in sheet_rows:
-            cells = {}
+            # Store cells by numeric column index (handles sparse rows correctly)
+            indexed_cells = {}
             for c in row_el.findall("s:c", ns):
-                ref  = c.get("r")             # e.g. A1
-                col  = ''.join(ch for ch in ref if ch.isalpha())
-                t    = c.get("t", "n")        # type
-                v_el = c.find("s:v", ns)
+                ref         = c.get("r")                                   # e.g. "B3"
+                col_letters = ''.join(ch for ch in ref if ch.isalpha())    # "B"
+                col_idx     = col_to_index(col_letters)                    # 1
+                t           = c.get("t", "n")                             # cell type
+                v_el        = c.find("s:v", ns)
+
                 if v_el is None or v_el.text is None:
-                    cells[col] = ""
-                    continue
-                if t == "s":                  # shared string
-                    cells[col] = shared[int(v_el.text)]
+                    indexed_cells[col_idx] = ""
+                elif t == "s":                                             # shared string
+                    indexed_cells[col_idx] = shared[int(v_el.text)]
                 else:
-                    cells[col] = v_el.text
+                    indexed_cells[col_idx] = v_el.text
+
+            if not indexed_cells:
+                continue
+
+            # Build an ordered list, filling gaps with ""
+            max_idx   = max(indexed_cells.keys())
+            cell_list = [indexed_cells.get(i, "") for i in range(max_idx + 1)]
 
             if header is None:
-                header = list(cells.values())
+                header = cell_list
             else:
-                row_dict = {header[i]: list(cells.values())[i]
-                            if i < len(list(cells.values())) else ""
-                            for i in range(len(header))}
+                row_dict = {
+                    header[i]: cell_list[i] if i < len(cell_list) else ""
+                    for i in range(len(header))
+                }
                 rows.append(row_dict)
     return rows
 
@@ -152,7 +184,7 @@ class Perceptron:
                 self.bias   += delta
                 errors += int(pred != yi)
             self.loss_history.append(errors)
-            preds = self.predict(X)
+            preds   = self.predict(X)
             correct = sum(p == t for p, t in zip(preds, y))
             self.acc_history.append(correct / len(y))
 
@@ -172,6 +204,7 @@ def sa_cost(sequence, plants, predictions):
         dist += euclidean(plants[sequence[k]]['pos'],
                           plants[sequence[k+1]]['pos'])
     return missed + dist + extra
+
 
 def simulated_annealing(sequence, plants, predictions,
                         T=100.0, cooling=0.95, iterations=500):
@@ -217,12 +250,9 @@ def draw_line_chart(canvas, data, title,
     y1 = y1 or h - 30
 
     canvas.delete("all")
-    # background
     canvas.create_rectangle(0, 0, w, h, fill="#253225", outline="")
-    # axes
     canvas.create_line(x0, y0, x0, y1, fill="#4caf50", width=2)
     canvas.create_line(x0, y1, x1, y1, fill="#4caf50", width=2)
-    # title
     canvas.create_text(w//2, 6, text=title, fill="#e8f5e9",
                        font=("Segoe UI", 9, "bold"), anchor="n")
     if not data:
@@ -234,35 +264,31 @@ def draw_line_chart(canvas, data, title,
     cw  = (x1 - x0)
     ch  = (y1 - y0)
 
-    def px(i):   return x0 + int(i / max(n-1,1) * cw)
+    def px(i):   return x0 + int(i / max(n-1, 1) * cw)
     def py(val): return y1 - int((val - mn) / (mx - mn) * ch)
 
-    # grid lines
     for step in range(0, 5):
-        gy = y0 + int(step / 4 * ch)
-        canvas.create_line(x0, gy, x1, gy, fill="#2a3d2a", dash=(3,3))
+        gy  = y0 + int(step / 4 * ch)
+        canvas.create_line(x0, gy, x1, gy, fill="#2a3d2a", dash=(3, 3))
         val = mx - step / 4 * (mx - mn)
         canvas.create_text(x0-4, gy, text=f"{val:.1f}",
-                           fill="#aed581", font=("Segoe UI",7), anchor="e")
+                           fill="#aed581", font=("Segoe UI", 7), anchor="e")
 
-    # line
     pts = [(px(i), py(v)) for i, v in enumerate(data)]
     for k in range(len(pts)-1):
         canvas.create_line(pts[k][0], pts[k][1],
                            pts[k+1][0], pts[k+1][1],
                            fill=line_color, width=2)
-    # dots at start/end
     for pt in [pts[0], pts[-1]]:
         canvas.create_oval(pt[0]-3, pt[1]-3, pt[0]+3, pt[1]+3,
                            fill=line_color, outline="white")
 
-    # x labels
     for i in [0, n//2, n-1]:
         canvas.create_text(px(i), y1+10, text=str(i),
-                           fill="#aed581", font=("Segoe UI",7))
+                           fill="#aed581", font=("Segoe UI", 7))
 
     canvas.create_text(x0-30, (y0+y1)//2, text=label_y,
-                       fill="#aed581", font=("Segoe UI",7), angle=90)
+                       fill="#aed581", font=("Segoe UI", 7), angle=90)
 
 
 # ─────────────────────────────────────────────
@@ -285,14 +311,15 @@ class PlantWateringApp(tk.Tk):
         self.resizable(True, True)
 
         # state
-        self.plants      = []
-        self.perceptron  = Perceptron()
-        self.trained     = False
-        self.X_mean      = []
-        self.X_std       = []
-        self.predictions = []
-        self.optimal_seq = []
+        self.plants       = []
+        self.perceptron   = Perceptron()
+        self.trained      = False
+        self.X_mean       = []
+        self.X_std        = []
+        self.predictions  = []
+        self.optimal_seq  = []
         self.placing_mode = False
+        self._sa_state    = None        # for animated SA
 
         self._build_ui()
         self._auto_train()
@@ -305,23 +332,23 @@ class PlantWateringApp(tk.Tk):
         style.theme_use("clam")
         BG, CARD, ACC, TXT, BTN = (self.BG, self.CARD, self.ACC, self.TXT, self.BTN)
 
-        style.configure("TNotebook",         background=BG,   borderwidth=0)
-        style.configure("TNotebook.Tab",     background=CARD, foreground=TXT,
-                        padding=[12,6], font=("Segoe UI",10,"bold"))
-        style.map("TNotebook.Tab",           background=[("selected", ACC)],
-                                             foreground=[("selected","#000")])
-        style.configure("TFrame",            background=BG)
-        style.configure("TLabel",            background=BG, foreground=TXT,
-                        font=("Segoe UI",10))
-        style.configure("TButton",           background=BTN, foreground=TXT,
-                        font=("Segoe UI",10,"bold"), borderwidth=0, padding=6)
-        style.map("TButton",                 background=[("active","#2e7d32")])
-        style.configure("Treeview",          background=CARD, foreground=TXT,
+        style.configure("TNotebook",        background=BG,   borderwidth=0)
+        style.configure("TNotebook.Tab",    background=CARD, foreground=TXT,
+                        padding=[12, 6], font=("Segoe UI", 10, "bold"))
+        style.map("TNotebook.Tab",          background=[("selected", ACC)],
+                                            foreground=[("selected", "#000")])
+        style.configure("TFrame",           background=BG)
+        style.configure("TLabel",           background=BG, foreground=TXT,
+                        font=("Segoe UI", 10))
+        style.configure("TButton",          background=BTN, foreground=TXT,
+                        font=("Segoe UI", 10, "bold"), borderwidth=0, padding=6)
+        style.map("TButton",                background=[("active", "#2e7d32")])
+        style.configure("Treeview",         background=CARD, foreground=TXT,
                         fieldbackground=CARD, rowheight=24)
-        style.configure("Treeview.Heading",  background=BTN, foreground=TXT,
-                        font=("Segoe UI",9,"bold"))
-        style.map("Treeview",                background=[("selected","#4caf50")],
-                                             foreground=[("selected","#000")])
+        style.configure("Treeview.Heading", background=BTN, foreground=TXT,
+                        font=("Segoe UI", 9, "bold"))
+        style.map("Treeview",               background=[("selected", "#4caf50")],
+                                            foreground=[("selected", "#000")])
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
@@ -346,19 +373,19 @@ class PlantWateringApp(tk.Tk):
         f = self.tab_garden
 
         left = tk.Frame(f, bg=CARD, width=265)
-        left.pack(side="left", fill="y", padx=(8,4), pady=8)
+        left.pack(side="left", fill="y", padx=(8, 4), pady=8)
         left.pack_propagate(False)
 
         tk.Label(left, text="➕  Add Plant", bg=CARD, fg=ACC,
-                 font=("Segoe UI",12,"bold")).pack(pady=(12,4))
+                 font=("Segoe UI", 12, "bold")).pack(pady=(12, 4))
 
         def lbl(t):
             tk.Label(left, text=t, bg=CARD, fg=TXT,
-                     font=("Segoe UI",9)).pack(anchor="w", padx=10, pady=(6,0))
+                     font=("Segoe UI", 9)).pack(anchor="w", padx=10, pady=(6, 0))
 
         lbl("Plant Name")
         self.e_name = tk.Entry(left, bg="#2e3d2e", fg=TXT, insertbackground=TXT,
-                               font=("Segoe UI",10), relief="flat")
+                               font=("Segoe UI", 10), relief="flat")
         self.e_name.pack(fill="x", padx=10)
         self.e_name.insert(0, "Plant A")
 
@@ -380,42 +407,48 @@ class PlantWateringApp(tk.Tk):
         self.v_type = tk.StringVar(value="0")
         frm_t = tk.Frame(left, bg=CARD)
         frm_t.pack(fill="x", padx=10, pady=4)
-        for lbl_t, val in [("Cactus 🌵","0"),("Flower 🌸","1"),("Herb 🌿","2")]:
+        for lbl_t, val in [("Cactus 🌵", "0"), ("Flower 🌸", "1"), ("Herb 🌿", "2")]:
             tk.Radiobutton(frm_t, text=lbl_t, variable=self.v_type, value=val,
                            bg=CARD, fg=TXT, selectcolor=ACC,
-                           font=("Segoe UI",9), activebackground=CARD).pack(anchor="w")
+                           font=("Segoe UI", 9), activebackground=CARD).pack(anchor="w")
 
         tk.Label(left, text="→ Click map to place",
                  bg=CARD, fg="#aed581",
-                 font=("Segoe UI",9,"italic")).pack(pady=4)
+                 font=("Segoe UI", 9, "italic")).pack(pady=4)
 
         self.btn_place = tk.Button(left, text="📍  Click to Place Plant",
                                    bg="#1565c0", fg="white",
-                                   font=("Segoe UI",10,"bold"), relief="flat",
+                                   font=("Segoe UI", 10, "bold"), relief="flat",
                                    command=self._toggle_place)
         self.btn_place.pack(fill="x", padx=10, pady=3)
 
         tk.Button(left, text="🗑  Clear All",
                   bg="#c62828", fg="white",
-                  font=("Segoe UI",10,"bold"), relief="flat",
+                  font=("Segoe UI", 10, "bold"), relief="flat",
                   command=self._clear_plants).pack(fill="x", padx=10, pady=3)
+
+        # Export button
+        tk.Button(left, text="💾  Export Results (CSV)",
+                  bg="#4527a0", fg="white",
+                  font=("Segoe UI", 10, "bold"), relief="flat",
+                  command=self._export_results).pack(fill="x", padx=10, pady=3)
 
         # plant list
         tk.Label(left, text="Plants in Garden", bg=CARD, fg=ACC,
-                 font=("Segoe UI",10,"bold")).pack(pady=(8,2))
-        cols = ("Name","Moist","Hrs","Type","💧")
+                 font=("Segoe UI", 10, "bold")).pack(pady=(8, 2))
+        cols = ("Name", "Moist", "Hrs", "Type", "💧")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", height=9)
-        for c, w in zip(cols, [68,40,40,48,30]):
+        for c, w in zip(cols, [68, 40, 40, 48, 30]):
             self.tree.heading(c, text=c)
             self.tree.column(c, width=w, anchor="center")
         self.tree.pack(fill="both", expand=True, padx=8, pady=4)
 
         # garden canvas
         right = tk.Frame(f, bg=BG)
-        right.pack(side="left", fill="both", expand=True, padx=(4,8), pady=8)
+        right.pack(side="left", fill="both", expand=True, padx=(4, 8), pady=8)
 
         tk.Label(right, text="Garden Map — click to place plants",
-                 bg=BG, fg=ACC, font=("Segoe UI",11,"bold")).pack(pady=(4,2))
+                 bg=BG, fg=ACC, font=("Segoe UI", 11, "bold")).pack(pady=(4, 2))
 
         self.canvas = tk.Canvas(right, bg="#1b2e1b", cursor="crosshair",
                                 highlightthickness=1, highlightbackground=ACC)
@@ -424,7 +457,7 @@ class PlantWateringApp(tk.Tk):
 
         self.lbl_status = tk.Label(right, text="⏳  Loading…",
                                    bg=BG, fg="#aed581",
-                                   font=("Segoe UI",9,"italic"))
+                                   font=("Segoe UI", 9, "italic"))
         self.lbl_status.pack(pady=4)
 
     # ──────────────────────────────────────────
@@ -439,18 +472,19 @@ class PlantWateringApp(tk.Tk):
 
         # --- left controls ---
         ctrl = tk.Frame(top, bg=CARD, width=240)
-        ctrl.pack(side="left", fill="y", padx=(0,8))
+        ctrl.pack(side="left", fill="y", padx=(0, 8))
         ctrl.pack_propagate(False)
 
         tk.Label(ctrl, text="Perceptron Settings", bg=CARD, fg=ACC,
-                 font=("Segoe UI",11,"bold")).pack(pady=(12,6))
+                 font=("Segoe UI", 11, "bold")).pack(pady=(12, 6))
 
         def row(lbl_t, default):
-            frm = tk.Frame(ctrl, bg=CARD); frm.pack(fill="x", padx=10, pady=3)
+            frm = tk.Frame(ctrl, bg=CARD)
+            frm.pack(fill="x", padx=10, pady=3)
             tk.Label(frm, text=lbl_t, bg=CARD, fg=TXT,
-                     font=("Segoe UI",9), width=16, anchor="w").pack(side="left")
+                     font=("Segoe UI", 9), width=16, anchor="w").pack(side="left")
             e = tk.Entry(frm, width=8, bg="#2e3d2e", fg=TXT,
-                         insertbackground=TXT, font=("Segoe UI",10), relief="flat")
+                         insertbackground=TXT, font=("Segoe UI", 10), relief="flat")
             e.insert(0, default)
             e.pack(side="left", padx=4)
             return e
@@ -458,49 +492,55 @@ class PlantWateringApp(tk.Tk):
         self.e_lr = row("Learning Rate", "0.1")
         self.e_ep = row("Epochs",        "50")
 
-        tk.Button(ctrl, text="🔁  Re-Train Perceptron",
+        tk.Button(ctrl, text="📂  Load Data & Train",
                   bg=self.BTN, fg="white",
-                  font=("Segoe UI",10,"bold"), relief="flat",
-                  command=self._retrain).pack(fill="x", padx=10, pady=8)
+                  font=("Segoe UI", 10, "bold"), relief="flat",
+                  command=self._retrain).pack(fill="x", padx=10, pady=4)
+
+        tk.Button(ctrl, text="🎲  Generate Sample Data",
+                  bg="#e65100", fg="white",
+                  font=("Segoe UI", 10, "bold"), relief="flat",
+                  command=self._generate_sample_data).pack(fill="x", padx=10, pady=4)
 
         self.lbl_acc = tk.Label(ctrl, text="Accuracy: —",
                                 bg=CARD, fg="#aed581",
-                                font=("Segoe UI",11,"bold"))
+                                font=("Segoe UI", 11, "bold"))
         self.lbl_acc.pack(pady=4)
 
-        self.lbl_wts = tk.Label(ctrl, text="Weights:\n  w1=—  w2=—  w3=—\nBias: —",
+        self.lbl_wts = tk.Label(ctrl,
+                                text="Weights:\n  w1=—  w2=—  w3=—\nBias: —",
                                 bg=CARD, fg=TXT,
-                                font=("Segoe UI",9), justify="left")
+                                font=("Segoe UI", 9), justify="left")
         self.lbl_wts.pack(pady=4, padx=10, anchor="w")
 
-        # separator
         tk.Frame(ctrl, bg="#4caf50", height=1).pack(fill="x", padx=10, pady=8)
 
         # test area
         tk.Label(ctrl, text="🔍  Test Perceptron", bg=CARD, fg=ACC,
-                 font=("Segoe UI",10,"bold")).pack(pady=(0,4))
+                 font=("Segoe UI", 10, "bold")).pack(pady=(0, 4))
 
         self.test_entries = []
-        for lbl_t, def_v in [("Moisture (0-100)","50"),
-                              ("Hours ago (0-48)","20"),
-                              ("Type (0/1/2)",    "1")]:
-            frm = tk.Frame(ctrl, bg=CARD); frm.pack(fill="x", padx=10, pady=2)
+        for lbl_t, def_v in [("Moisture (0-100)", "50"),
+                              ("Hours ago (0-48)", "20"),
+                              ("Type (0/1/2)",     "1")]:
+            frm = tk.Frame(ctrl, bg=CARD)
+            frm.pack(fill="x", padx=10, pady=2)
             tk.Label(frm, text=lbl_t, bg=CARD, fg=TXT,
-                     font=("Segoe UI",8), width=16, anchor="w").pack(side="left")
+                     font=("Segoe UI", 8), width=16, anchor="w").pack(side="left")
             e = tk.Entry(frm, width=6, bg="#2e3d2e", fg=TXT,
-                         insertbackground=TXT, font=("Segoe UI",9), relief="flat")
+                         insertbackground=TXT, font=("Segoe UI", 9), relief="flat")
             e.insert(0, def_v)
             e.pack(side="left", padx=2)
             self.test_entries.append(e)
 
         tk.Button(ctrl, text="Predict →",
                   bg="#1565c0", fg="white",
-                  font=("Segoe UI",10,"bold"), relief="flat",
+                  font=("Segoe UI", 10, "bold"), relief="flat",
                   command=self._test_perceptron).pack(fill="x", padx=10, pady=6)
 
         self.lbl_pred = tk.Label(ctrl, text="Result: —",
                                  bg=CARD, fg="#fff176",
-                                 font=("Segoe UI",11,"bold"))
+                                 font=("Segoe UI", 11, "bold"))
         self.lbl_pred.pack(pady=2)
 
         # --- right charts (pure tk.Canvas) ---
@@ -511,7 +551,7 @@ class PlantWateringApp(tk.Tk):
                                     width=320, height=260,
                                     highlightthickness=1,
                                     highlightbackground="#4caf50")
-        self.chart_loss.pack(side="left", fill="both", expand=True, padx=(0,6))
+        self.chart_loss.pack(side="left", fill="both", expand=True, padx=(0, 6))
 
         self.chart_acc = tk.Canvas(chart_frame, bg="#253225",
                                    width=320, height=260,
@@ -531,18 +571,19 @@ class PlantWateringApp(tk.Tk):
 
         # --- left controls ---
         ctrl = tk.Frame(top, bg=CARD, width=240)
-        ctrl.pack(side="left", fill="y", padx=(0,8))
+        ctrl.pack(side="left", fill="y", padx=(0, 8))
         ctrl.pack_propagate(False)
 
         tk.Label(ctrl, text="SA Settings", bg=CARD, fg=ACC,
-                 font=("Segoe UI",11,"bold")).pack(pady=(12,6))
+                 font=("Segoe UI", 11, "bold")).pack(pady=(12, 6))
 
         def row(lbl_t, default):
-            frm = tk.Frame(ctrl, bg=CARD); frm.pack(fill="x", padx=10, pady=3)
+            frm = tk.Frame(ctrl, bg=CARD)
+            frm.pack(fill="x", padx=10, pady=3)
             tk.Label(frm, text=lbl_t, bg=CARD, fg=TXT,
-                     font=("Segoe UI",9), width=16, anchor="w").pack(side="left")
+                     font=("Segoe UI", 9), width=16, anchor="w").pack(side="left")
             e = tk.Entry(frm, width=8, bg="#2e3d2e", fg=TXT,
-                         insertbackground=TXT, font=("Segoe UI",10), relief="flat")
+                         insertbackground=TXT, font=("Segoe UI", 10), relief="flat")
             e.insert(0, default)
             e.pack(side="left", padx=4)
             return e
@@ -551,24 +592,77 @@ class PlantWateringApp(tk.Tk):
         self.e_cool = row("Cooling Rate",  "0.95")
         self.e_iter = row("Iterations",    "500")
 
+        # ── Plant selection section ──────────────
+        tk.Frame(ctrl, bg="#4caf50", height=1).pack(fill="x", padx=10, pady=(8, 4))
+        tk.Label(ctrl, text="🌿  Plant Selection", bg=CARD, fg=ACC,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10)
+
+        # Mode: manual count vs auto (predictions)
+        self.v_sa_mode = tk.StringVar(value="auto")
+        frm_mode = tk.Frame(ctrl, bg=CARD)
+        frm_mode.pack(fill="x", padx=10, pady=4)
+        tk.Radiobutton(frm_mode, text="Auto (needs_water=1)",
+                       variable=self.v_sa_mode, value="auto",
+                       bg=CARD, fg=TXT, selectcolor=ACC,
+                       font=("Segoe UI", 9), activebackground=CARD,
+                       command=self._on_sa_mode_change).pack(anchor="w")
+        tk.Radiobutton(frm_mode, text="Manual count",
+                       variable=self.v_sa_mode, value="manual",
+                       bg=CARD, fg=TXT, selectcolor=ACC,
+                       font=("Segoe UI", 9), activebackground=CARD,
+                       command=self._on_sa_mode_change).pack(anchor="w")
+
+        # Manual count entry (shown only when mode=manual)
+        self.frm_manual = tk.Frame(ctrl, bg=CARD)
+        self.frm_manual.pack(fill="x", padx=10, pady=2)
+        tk.Label(self.frm_manual, text="# plants to water:",
+                 bg=CARD, fg=TXT, font=("Segoe UI", 9)).pack(side="left")
+        self.e_num_plants = tk.Entry(self.frm_manual, width=5,
+                                     bg="#2e3d2e", fg=TXT,
+                                     insertbackground=TXT,
+                                     font=("Segoe UI", 10), relief="flat")
+        self.e_num_plants.insert(0, "3")
+        self.e_num_plants.pack(side="left", padx=6)
+        self.frm_manual.pack_forget()   # hidden by default (auto mode)
+
+        # Info label showing how many plants are selected
+        self.lbl_sa_selection = tk.Label(ctrl, text="Selected: —",
+                                         bg=CARD, fg="#aed581",
+                                         font=("Segoe UI", 9, "italic"))
+        self.lbl_sa_selection.pack(pady=2)
+
+        tk.Frame(ctrl, bg="#4caf50", height=1).pack(fill="x", padx=10, pady=(4, 8))
+
         tk.Button(ctrl, text="🚀  Run SA Optimizer",
                   bg=self.BTN, fg="white",
-                  font=("Segoe UI",10,"bold"), relief="flat",
-                  command=self._run_sa).pack(fill="x", padx=10, pady=8)
+                  font=("Segoe UI", 10, "bold"), relief="flat",
+                  command=self._run_sa).pack(fill="x", padx=10, pady=4)
+
+        # NEW: Animated SA button
+        tk.Button(ctrl, text="🎬  Animated SA (Step by Step)",
+                  bg="#6a1b9a", fg="white",
+                  font=("Segoe UI", 10, "bold"), relief="flat",
+                  command=self._run_sa_animated).pack(fill="x", padx=10, pady=4)
 
         self.lbl_sa_cost = tk.Label(ctrl, text="Best Cost: —",
                                     bg=CARD, fg="#fff176",
-                                    font=("Segoe UI",12,"bold"))
+                                    font=("Segoe UI", 12, "bold"))
         self.lbl_sa_cost.pack(pady=4)
+
+        # NEW: step counter label
+        self.lbl_sa_step = tk.Label(ctrl, text="Step: —",
+                                    bg=CARD, fg="#aed581",
+                                    font=("Segoe UI", 9))
+        self.lbl_sa_step.pack(pady=2)
 
         tk.Frame(ctrl, bg="#4caf50", height=1).pack(fill="x", padx=10, pady=6)
 
         tk.Label(ctrl, text="Optimal Watering Order:", bg=CARD, fg=ACC,
-                 font=("Segoe UI",9,"bold")).pack(anchor="w", padx=10)
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=10)
 
         self.txt_order = tk.Text(ctrl, height=12, width=22,
                                  bg="#2e3d2e", fg="#aed581",
-                                 font=("Segoe UI",9), relief="flat",
+                                 font=("Segoe UI", 9), relief="flat",
                                  state="disabled")
         self.txt_order.pack(fill="x", padx=10, pady=4)
 
@@ -580,7 +674,7 @@ class PlantWateringApp(tk.Tk):
                                        width=310, height=280,
                                        highlightthickness=1,
                                        highlightbackground="#4caf50")
-        self.chart_sa_cost.pack(side="left", fill="both", expand=True, padx=(0,6))
+        self.chart_sa_cost.pack(side="left", fill="both", expand=True, padx=(0, 6))
 
         self.chart_path = tk.Canvas(chart_frame, bg="#1b2e1b",
                                     width=310, height=280,
@@ -592,15 +686,71 @@ class PlantWateringApp(tk.Tk):
     #  DATA LOADING & TRAINING
     # ══════════════════════════════════════════
     def _auto_train(self):
-        # try default path next to script
+        """Try to load Data.xlsx from same folder; fall back to synthetic data."""
         default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data.xlsx")
         if os.path.exists(default):
             self._train_from_file(default)
         else:
-            self.lbl_status.config(
-                text="⚠️  Data.xlsx not found — use Re-Train to load manually")
+            # Auto-generate synthetic data so the app is immediately usable
+            self._generate_sample_data()
+
+    def _generate_sample_data(self):
+        """Generate 200 synthetic training samples and train the perceptron."""
+        try:
+            lr = float(self.e_lr.get())
+            ep = int(self.e_ep.get())
+        except ValueError:
+            lr, ep = 0.1, 50
+        self.perceptron.lr     = lr
+        self.perceptron.epochs = ep
+
+        X_raw, y = [], []
+        for _ in range(200):
+            moisture = random.uniform(0, 100)
+            last_w   = random.uniform(0, 48)
+            ptype    = random.randint(0, 2)
+
+            # Cactus needs water less often
+            threshold = 30 if ptype == 0 else 45
+            needs = 1 if (moisture < threshold or last_w > 24) else 0
+            # 5 % label noise
+            if random.random() < 0.05:
+                needs = 1 - needs
+
+            X_raw.append([moisture, last_w, float(ptype)])
+            y.append(needs)
+
+        X_norm, self.X_mean, self.X_std = normalise_dataset(X_raw)
+
+        indices = list(range(len(X_norm)))
+        random.shuffle(indices)
+        split = int(0.8 * len(indices))
+        tr, te = indices[:split], indices[split:]
+
+        X_tr = [X_norm[i] for i in tr]; y_tr = [y[i] for i in tr]
+        X_te = [X_norm[i] for i in te]; y_te = [y[i] for i in te]
+
+        self.perceptron.fit(X_tr, y_tr)
+        preds_te = self.perceptron.predict(X_te)
+        acc = sum(p == t for p, t in zip(preds_te, y_te)) / len(y_te)
+
+        self.trained = True
+        self._update_perceptron_ui(acc)
+        self.lbl_status.config(
+            text=f"✅  Auto-generated 200 samples — Val Accuracy: {acc*100:.1f}%")
+        self._update_all_predictions()
+        self._redraw_garden()
+        self._update_tree()
 
     def _train_from_file(self, path):
+        try:
+            lr = float(self.e_lr.get())
+            ep = int(self.e_ep.get())
+        except ValueError:
+            lr, ep = 0.1, 50
+        self.perceptron.lr     = lr
+        self.perceptron.epochs = ep
+
         try:
             raw = read_xlsx(path)
             X_raw, y = [], []
@@ -616,11 +766,12 @@ class PlantWateringApp(tk.Tk):
                     continue
 
             if not X_raw:
-                raise ValueError("No valid rows found in xlsx")
+                raise ValueError("No valid rows found in xlsx.\n"
+                                 "Expected columns: soil_moisture, last_watered, "
+                                 "plant_type, needs_water")
 
             X_norm, self.X_mean, self.X_std = normalise_dataset(X_raw)
 
-            # 80/20 split (shuffle indices manually)
             indices = list(range(len(X_norm)))
             random.shuffle(indices)
             split   = int(0.8 * len(indices))
@@ -637,20 +788,17 @@ class PlantWateringApp(tk.Tk):
             self._update_perceptron_ui(acc)
             self.lbl_status.config(
                 text=f"✅  Trained on {len(X_tr)} samples — Val Accuracy: {acc*100:.1f}%")
+            self._update_all_predictions()
+            self._redraw_garden()
+            self._update_tree()
+
         except Exception as ex:
             messagebox.showerror("Training Error", str(ex))
 
     def _retrain(self):
-        try:
-            self.perceptron.lr     = float(self.e_lr.get())
-            self.perceptron.epochs = int(self.e_ep.get())
-        except ValueError:
-            messagebox.showerror("Input Error", "Invalid LR or Epochs value.")
-            return
-
         path = filedialog.askopenfilename(
             title="Select Data.xlsx",
-            filetypes=[("Excel files","*.xlsx"), ("All files","*.*")])
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
         if path:
             self._train_from_file(path)
 
@@ -658,7 +806,9 @@ class PlantWateringApp(tk.Tk):
         self.lbl_acc.config(text=f"Val Accuracy: {acc*100:.1f}%")
         w = self.perceptron.weights
         self.lbl_wts.config(
-            text=f"Weights:\n  w1={w[0]:.4f}\n  w2={w[1]:.4f}\n  w3={w[2]:.4f}\nBias: {self.perceptron.bias:.4f}")
+            text=(f"Weights:\n  w1={w[0]:.4f}\n"
+                  f"  w2={w[1]:.4f}\n"
+                  f"  w3={w[2]:.4f}\nBias: {self.perceptron.bias:.4f}"))
 
         draw_line_chart(self.chart_loss, self.perceptron.loss_history,
                         "Training Loss (errors per epoch)",
@@ -696,12 +846,11 @@ class PlantWateringApp(tk.Tk):
             "plant_type": ptype, "pred": pred
         })
 
-        # auto-increment name
-        import re
+        # auto-increment name  (e.g. "Plant A1" → "Plant A2")
         m = re.match(r"^(.*?)(\d+)$", name)
         if m:
             self.e_name.delete(0, "end")
-            self.e_name.insert(0, m.group(1) + str(int(m.group(2))+1))
+            self.e_name.insert(0, m.group(1) + str(int(m.group(2)) + 1))
 
         self.placing_mode = False
         self.btn_place.config(bg="#1565c0", text="📍  Click to Place Plant")
@@ -719,7 +868,8 @@ class PlantWateringApp(tk.Tk):
 
     def _update_all_predictions(self):
         for p in self.plants:
-            p['pred'] = self._predict_one(p['moisture'], p['last_watered'], p['plant_type'])
+            p['pred'] = self._predict_one(
+                p['moisture'], p['last_watered'], p['plant_type'])
         self.predictions = [p['pred'] for p in self.plants]
 
     def _redraw_garden(self, highlight_seq=None):
@@ -739,49 +889,85 @@ class PlantWateringApp(tk.Tk):
                 p1 = self.plants[highlight_seq[k]]['pos']
                 p2 = self.plants[highlight_seq[k+1]]['pos']
                 self.canvas.create_line(p1[0], p1[1], p2[0], p2[1],
-                                        fill="#ffd54f", width=2, dash=(6,4))
+                                        fill="#ffd54f", width=2, dash=(6, 4))
 
-        icons = {0:"🌵", 1:"🌸", 2:"🌿"}
+        icons = {0: "🌵", 1: "🌸", 2: "🌿"}
         for i, p in enumerate(self.plants):
             px, py = p['pos']
             col = "#ef5350" if p['pred'] == 1 else "#66bb6a"
             self.canvas.create_oval(px-18, py-18, px+18, py+18,
                                     fill=col, outline="white", width=2)
-            self.canvas.create_text(px, py-2, text=icons.get(p['plant_type'],'?'),
-                                    font=("Segoe UI",13))
+            self.canvas.create_text(px, py-2, text=icons.get(p['plant_type'], '?'),
+                                    font=("Segoe UI", 13))
             if highlight_seq and i in highlight_seq:
                 rank = highlight_seq.index(i) + 1
                 self.canvas.create_text(px+16, py-16, text=str(rank),
                                         fill="#ffd54f",
-                                        font=("Segoe UI",8,"bold"))
+                                        font=("Segoe UI", 8, "bold"))
             self.canvas.create_text(px, py+28, text=p['name'],
-                                    fill="white", font=("Segoe UI",8,"bold"))
+                                    fill="white", font=("Segoe UI", 8, "bold"))
 
         # legend
-        self.canvas.create_rectangle(6, 6, 195, 58, fill="#253225", outline="#4caf50")
-        self.canvas.create_oval(14,14,26,26, fill="#ef5350", outline="")
-        self.canvas.create_text(115, 20, text="💧 Needs Watering",
-                                fill="#ef5350", font=("Segoe UI",8,"bold"))
-        self.canvas.create_oval(14,34,26,46, fill="#66bb6a", outline="")
-        self.canvas.create_text(115, 40, text="✅ Does NOT Need Water",
-                                fill="#66bb6a", font=("Segoe UI",8,"bold"))
+        self.canvas.create_rectangle(6, 6, 210, 58, fill="#253225", outline="#4caf50")
+        self.canvas.create_oval(14, 14, 26, 26, fill="#ef5350", outline="")
+        self.canvas.create_text(120, 20, text="💧 Needs Watering",
+                                fill="#ef5350", font=("Segoe UI", 8, "bold"))
+        self.canvas.create_oval(14, 34, 26, 46, fill="#66bb6a", outline="")
+        self.canvas.create_text(120, 40, text="✅ Does NOT Need Water",
+                                fill="#66bb6a", font=("Segoe UI", 8, "bold"))
 
     def _update_tree(self):
         for row in self.tree.get_children():
             self.tree.delete(row)
-        type_map = {0:"Cactus", 1:"Flower", 2:"Herb"}
+        type_map = {0: "Cactus", 1: "Flower", 2: "Herb"}
         for p in self.plants:
             self.tree.insert("", "end", values=(
                 p['name'], p['moisture'], p['last_watered'],
-                type_map.get(p['plant_type'],'?'),
-                "💧" if p['pred']==1 else "✅"))
+                type_map.get(p['plant_type'], '?'),
+                "💧" if p['pred'] == 1 else "✅"))
 
     def _clear_plants(self):
         self.plants.clear()
         self.predictions.clear()
         self.optimal_seq = []
+        self._sa_state   = None
         self._redraw_garden()
         self._update_tree()
+
+    # ══════════════════════════════════════════
+    #  EXPORT RESULTS
+    # ══════════════════════════════════════════
+    def _export_results(self):
+        if not self.plants:
+            messagebox.showwarning("No Data", "No plants to export.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            title="Save Results as CSV")
+        if not path:
+            return
+
+        type_map  = {0: "Cactus", 1: "Flower", 2: "Herb"}
+        order_map = {idx: rank+1 for rank, idx in enumerate(self.optimal_seq)}
+
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Order", "Name", "X", "Y",
+                             "SoilMoisture", "LastWatered",
+                             "PlantType", "NeedsWater"])
+            for i, p in enumerate(self.plants):
+                writer.writerow([
+                    order_map.get(i, "-"),
+                    p["name"],
+                    p["pos"][0], p["pos"][1],
+                    p["moisture"], p["last_watered"],
+                    type_map.get(p["plant_type"], "?"),
+                    "Yes" if p["pred"] == 1 else "No"
+                ])
+
+        messagebox.showinfo("Exported", f"Results saved to:\n{path}")
 
     # ══════════════════════════════════════════
     #  PERCEPTRON TEST
@@ -795,12 +981,62 @@ class PlantWateringApp(tk.Tk):
         except ValueError:
             messagebox.showerror("Input Error", "Enter valid numbers.")
             return
-        pred = self._predict_one(*vals)
+        pred   = self._predict_one(*vals)
         result = "💧 Needs Watering" if pred == 1 else "✅ Does NOT Need Water"
         self.lbl_pred.config(text=f"Result: {result}")
 
     # ══════════════════════════════════════════
-    #  SIMULATED ANNEALING
+    #  SA MODE TOGGLE
+    # ══════════════════════════════════════════
+    def _on_sa_mode_change(self):
+        if self.v_sa_mode.get() == "manual":
+            self.frm_manual.pack(fill="x", padx=10, pady=2,
+                                 before=self.lbl_sa_selection)
+        else:
+            self.frm_manual.pack_forget()
+
+    # ──────────────────────────────────────────
+    #  Build the initial sequence based on mode
+    # ──────────────────────────────────────────
+    def _build_initial_sequence(self):
+        """
+        Returns a randomly-ordered list of plant indices to feed into SA.
+
+        Mode "auto":   only plants the perceptron predicted as needing water.
+                       If none predicted, fall back to all plants.
+        Mode "manual": a random sample of k plants (k from the entry widget).
+                       k is clamped to [1, len(plants)].
+        """
+        self._update_all_predictions()
+        n = len(self.plants)
+
+        if self.v_sa_mode.get() == "auto":
+            needs = [i for i, p in enumerate(self.predictions) if p == 1]
+            if not needs:
+                # no plant predicted to need water → water all
+                needs = list(range(n))
+                self.lbl_sa_selection.config(
+                    text=f"Selected: all {n} (none predicted needy)")
+            else:
+                self.lbl_sa_selection.config(
+                    text=f"Selected: {len(needs)} / {n}  (auto)")
+            seq = needs[:]
+            random.shuffle(seq)
+            return seq
+
+        else:  # manual
+            try:
+                k = int(self.e_num_plants.get())
+            except ValueError:
+                k = n
+            k = max(1, min(k, n))
+            seq = random.sample(range(n), k)
+            self.lbl_sa_selection.config(
+                text=f"Selected: {k} / {n}  (manual)")
+            return seq
+
+    # ══════════════════════════════════════════
+    #  SIMULATED ANNEALING — instant run
     # ══════════════════════════════════════════
     def _run_sa(self):
         if len(self.plants) < 2:
@@ -818,23 +1054,108 @@ class PlantWateringApp(tk.Tk):
             messagebox.showerror("Input Error", "Invalid SA parameter.")
             return
 
-        self._update_all_predictions()
-
-        seq = list(range(len(self.plants)))
-        random.shuffle(seq)
+        seq = self._build_initial_sequence()   # ← uses selection mode
 
         best_seq, best_cost, history = simulated_annealing(
             seq, self.plants, self.predictions,
             T=T, cooling=cool, iterations=itr)
 
         self.optimal_seq = best_seq
+        self._finish_sa(best_seq, best_cost, history)
 
+    # ══════════════════════════════════════════
+    #  SIMULATED ANNEALING — animated step-by-step
+    # ══════════════════════════════════════════
+    def _run_sa_animated(self):
+        if len(self.plants) < 2:
+            messagebox.showwarning("Too few plants",
+                                   "Add at least 2 plants to the garden first!")
+            return
+        if not self.trained:
+            messagebox.showwarning("Not Trained", "Train the Perceptron first!")
+            return
+        try:
+            T    = float(self.e_T.get())
+            cool = float(self.e_cool.get())
+            itr  = int(self.e_iter.get())
+        except ValueError:
+            messagebox.showerror("Input Error", "Invalid SA parameter.")
+            return
+
+        seq       = self._build_initial_sequence()   # ← uses selection mode
+        init_cost = sa_cost(seq, self.plants, self.predictions)
+
+        self._sa_state = {
+            "seq":          seq,
+            "current_cost": init_cost,
+            "best_seq":     seq[:],
+            "best_cost":    init_cost,
+            "T":            T,
+            "cooling":      cool,
+            "step":         0,
+            "total_steps":  itr,
+            "history":      [init_cost],
+        }
+        self._animate_sa_step()
+
+    def _animate_sa_step(self):
+        """Advance one SA step and reschedule itself via after()."""
+        state = self._sa_state
+        if state is None:
+            return
+
+        if state["step"] >= state["total_steps"] or len(state["seq"]) < 2:
+            # ── done ──
+            self.optimal_seq = state["best_seq"]
+            self._finish_sa(state["best_seq"], state["best_cost"], state["history"])
+            self.lbl_sa_step.config(text=f"Step: {state['step']} (done)")
+            return
+
+        # one SA step
+        i, j = random.sample(range(len(state["seq"])), 2)
+        new_seq      = state["seq"][:]
+        new_seq[i], new_seq[j] = new_seq[j], new_seq[i]
+        new_cost     = sa_cost(new_seq, self.plants, self.predictions)
+        delta        = new_cost - state["current_cost"]
+
+        if delta < 0 or random.random() < math.exp(-delta / max(state["T"], 1e-9)):
+            state["seq"]          = new_seq
+            state["current_cost"] = new_cost
+            if new_cost < state["best_cost"]:
+                state["best_seq"]  = new_seq[:]
+                state["best_cost"] = new_cost
+
+        state["T"]       *= state["cooling"]
+        state["history"].append(state["current_cost"])
+        state["step"]    += 1
+
+        # update UI every 10 steps to stay responsive
+        if state["step"] % 10 == 0:
+            self.lbl_sa_cost.config(
+                text=f"Best Cost: {state['best_cost']:.2f}")
+            self.lbl_sa_step.config(
+                text=f"Step: {state['step']} / {state['total_steps']} "
+                     f"| T={state['T']:.2f}")
+            self._redraw_garden(highlight_seq=state["seq"])
+            draw_line_chart(self.chart_sa_cost, state["history"],
+                            "SA Cost Convergence",
+                            line_color="#ffa726", label_y="Cost")
+            self._draw_path_minimap(state["seq"])
+
+        # slower for first 100 steps so the user can see movement
+        delay = 40 if state["step"] < 100 else 5
+        self.after(delay, self._animate_sa_step)
+
+    # ──────────────────────────────────────────
+    #  Shared finish routine for both SA modes
+    # ──────────────────────────────────────────
+    def _finish_sa(self, best_seq, best_cost, history):
         self.lbl_sa_cost.config(text=f"Best Cost: {best_cost:.2f}")
 
-        # order text
+        # watering order text
         self.txt_order.config(state="normal")
         self.txt_order.delete("1.0", "end")
-        icons = {0:"🌵", 1:"🌸", 2:"🌿"}
+        icons = {0: "🌵", 1: "🌸", 2: "🌿"}
         for rank, idx in enumerate(best_seq, 1):
             p    = self.plants[idx]
             icon = icons.get(p['plant_type'], '?')
@@ -842,7 +1163,7 @@ class PlantWateringApp(tk.Tk):
             self.txt_order.insert("end", f"{rank}. {icon} {p['name']} {need}\n")
         self.txt_order.config(state="disabled")
 
-        # redraw garden with path
+        # redraw garden with optimal path
         self._redraw_garden(highlight_seq=best_seq)
 
         # SA convergence chart
@@ -860,43 +1181,40 @@ class PlantWateringApp(tk.Tk):
         ch = int(canvas["height"])
         canvas.create_rectangle(0, 0, cw, ch, fill="#1b2e1b", outline="")
         canvas.create_text(cw//2, 10, text="Watering Path (minimap)",
-                           fill="#e8f5e9", font=("Segoe UI",9,"bold"))
+                           fill="#e8f5e9", font=("Segoe UI", 9, "bold"))
 
         if not self.plants:
             return
 
-        # scale positions to fit canvas
         all_x = [p['pos'][0] for p in self.plants]
         all_y = [p['pos'][1] for p in self.plants]
         min_x, max_x = min(all_x), max(all_x)
         min_y, max_y = min(all_y), max(all_y)
         rng_x = max(max_x - min_x, 1)
         rng_y = max(max_y - min_y, 1)
-        PAD = 30
+        PAD   = 30
 
-        def sx(x): return PAD + int((x-min_x)/rng_x*(cw-2*PAD))
-        def sy(y): return PAD + int((y-min_y)/rng_y*(ch-2*PAD))
+        def sx(x): return PAD + int((x - min_x) / rng_x * (cw - 2*PAD))
+        def sy(y): return PAD + int((y - min_y) / rng_y * (ch - 2*PAD))
 
-        # path lines
         if len(seq) > 1:
             for k in range(len(seq)-1):
                 p1 = self.plants[seq[k]]['pos']
                 p2 = self.plants[seq[k+1]]['pos']
                 canvas.create_line(sx(p1[0]), sy(p1[1]),
                                    sx(p2[0]), sy(p2[1]),
-                                   fill="#ffd54f", width=2, dash=(5,3))
+                                   fill="#ffd54f", width=2, dash=(5, 3))
 
-        icons = {0:"🌵", 1:"🌸", 2:"🌿"}
+        icons = {0: "🌵", 1: "🌸", 2: "🌿"}
         for rank, idx in enumerate(seq):
-            p  = self.plants[idx]
-            px, py = sx(p['pos'][0]), sy(p['pos'][1])
-            col = "#ef5350" if p['pred'] == 1 else "#66bb6a"
+            p       = self.plants[idx]
+            px, py  = sx(p['pos'][0]), sy(p['pos'][1])
+            col     = "#ef5350" if p['pred'] == 1 else "#66bb6a"
             canvas.create_oval(px-10, py-10, px+10, py+10,
                                fill=col, outline="white", width=1)
             canvas.create_text(px, py, text=str(rank+1),
-                               fill="white", font=("Segoe UI",7,"bold"))
+                               fill="white", font=("Segoe UI", 7, "bold"))
 
-        # non-sequenced plants (if any)
         seq_set = set(seq)
         for i, p in enumerate(self.plants):
             if i not in seq_set:

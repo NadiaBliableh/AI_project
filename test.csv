@@ -1,0 +1,3 @@
+Order,Name,X,Y,SoilMoisture,LastWatered,PlantType,NeedsWater
+-,Plant A,138,117,30,12,Cactus,No
+-,Plant A,140,247,20,38,Herb,Yes
